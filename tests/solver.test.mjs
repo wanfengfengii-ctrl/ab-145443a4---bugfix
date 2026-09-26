@@ -470,7 +470,15 @@ test('全盒暴力对拍：小规模随机用例的稳健结论与逐点重解�
         rec(i + 1);
       }
     })(0);
-    first.sort((p, q) => p.off - q.off || (p.f < q.f ? -1 : p.f > q.f ? 1 : 0));
+    first.sort((p, q) => {
+      if (p.off !== q.off) return p.off - q.off;
+      // 并列总偏移：先比单类最大偏移（均摊），再比频次序列字典序
+      const sp = Math.max(...p.f.map((f, k) => Math.abs(f - f0[k])));
+      const sq = Math.max(...q.f.map((f, k) => Math.abs(f - f0[k])));
+      if (sp !== sq) return sp - sq;
+      for (let k = 0; k < p.f.length; k++) if (p.f[k] !== q.f[k]) return p.f[k] - q.f[k];
+      return 0;
+    });
 
     if (first.length === 0) {
       assert.equal(r.status, 'robust', `用例 ${tc} 应为稳健`);
@@ -510,4 +518,94 @@ test('大漂移大频次：复核可完成且见证/证书结构自洽', () => {
   } else {
     assert.ok(r.tuplesEnumerated > 0);
   }
+});
+
+test('大漂移稳健性复核：5 类频次 100..104、幅度各 100 快速给出规范最小反例', () => {
+  // 回归"大漂移长期无结果"：不抽样、不缩小漂移范围，覆盖全部 201^5 个频次组合，
+  // 在可交互时间内精确返回 (总偏移=2, 单类最大偏移最小, 频次字典序最小) 的反例。
+  const input = {
+    alerts: [
+      robustAlert('a0', 100, 1, 12), robustAlert('a1', 101, 1, 12),
+      robustAlert('a2', 102, 1, 12), robustAlert('a3', 103, 1, 12),
+      robustAlert('a4', 104, 1, 12),
+    ],
+    reserved: [],
+    drifts: [100, 100, 100, 100, 100],
+  };
+  assert.equal(solve(input).alerts.map((a) => a.code).join('|'), '000|001|01|10|11');
+  const t0 = performance.now();
+  const r = checkRobustness(input);
+  const elapsed = performance.now() - t0;
+
+  assert.equal(r.status, 'counterexample');
+  assert.equal(r.combos, String(201 ** 5)); // 全部频次组合数，不抽样
+  const w = r.witness;
+  assert.equal(w.totalOffset, 2);
+  assert.deepEqual(w.freqs, [100, 102, 101, 103, 104]);
+  assert.deepEqual(w.offsets, [0, 1, 1, 0, 0]);
+  assert.equal(w.firstChangedLevel, 1);
+  // 并列总偏移 2 时取单类最大偏移最小者：
+  // [100,101,100,...] 把两类偏移压到同一类（单类偏移 2），不规范；
+  // (a1+1, a2−1) 均摊为两个单类偏移 1，故为规范反例。
+  assert.ok(w.replacement.cost < w.baseline.costAtWitness);
+  assert.ok(isPrefixFree(w.replacement.codes));
+  w.freqs.forEach((f, i) => {
+    assert.ok(f >= input.alerts[i].freq - 100 && f <= input.alerts[i].freq + 100);
+  });
+  assert.ok(elapsed < 5000, `大漂移复核耗时 ${elapsed.toFixed(0)}ms 超出交互时限`);
+});
+
+test('规范反例键：同总偏移下单类最大偏移（均摊）优先于频次字典序', () => {
+  // 同一长度交换元组在偏移 2 上有两类见证：单类偏移 2 的 (0,+2)/(0,−2) 点
+  // 与均摊的 (+1,−1) 点；后者单类最大偏移 1 更小，必须胜出。
+  const input = {
+    alerts: [
+      robustAlert('a0', 100, 1, 12), robustAlert('a1', 101, 1, 12),
+      robustAlert('a2', 102, 1, 12), robustAlert('a3', 103, 1, 12),
+      robustAlert('a4', 104, 1, 12),
+    ],
+    reserved: [],
+    drifts: [100, 100, 100, 100, 100],
+  };
+  const r = checkRobustness(input);
+  assert.equal(r.status, 'counterexample');
+  assert.deepEqual(r.witness.freqs, [100, 102, 101, 103, 104]);
+  assert.equal(Math.max(...r.witness.offsets), 1);
+});
+
+test('大漂移下仍稳健：码长元组唯一时给出覆盖全盒的稳健证书', () => {
+  // 5 类固定码长 3：无任何可替代长度元组，即便漂移幅度取满（盒超 10^15 组合）
+  // 也必须快速给出稳健证书，且组合数精确（BigInt），不得抽样或报错。
+  const input = {
+    alerts: [
+      robustAlert('a0', 500, 3, 3), robustAlert('a1', 501, 3, 3),
+      robustAlert('a2', 502, 3, 3), robustAlert('a3', 503, 3, 3),
+      robustAlert('a4', 504, 3, 3),
+    ],
+    reserved: [],
+    drifts: [500, 501, 502, 503, 504],
+  };
+  const t0 = performance.now();
+  const r = checkRobustness(input);
+  const elapsed = performance.now() - t0;
+  assert.equal(r.status, 'robust');
+  const expectedCombos = [1001, 1003, 1005, 1007, 1009].reduce((a, b) => a * BigInt(b), 1n).toString();
+  assert.equal(r.combos, expectedCombos);
+  assert.equal(r.strictCandidates, 0);
+  assert.equal(r.tieCandidates, 0);
+  assert.ok(elapsed < 3000);
+});
+
+test('性能：8 类宽区间、幅度 100 的大漂移复核在时限内完成且不出 error', () => {
+  const input = {
+    alerts: Array.from({ length: 8 }, (_, i) => robustAlert(`a${i}`, 100 + i, 1, MAX_CODE_LENGTH)),
+    reserved: [],
+    drifts: Array(8).fill(100),
+  };
+  const t0 = performance.now();
+  const r = checkRobustness(input);
+  const elapsed = performance.now() - t0;
+  assert.ok(['robust', 'counterexample'].includes(r.status));
+  assert.notEqual(r.status, 'error');
+  assert.ok(elapsed < 10000, `耗时 ${elapsed.toFixed(0)}ms`);
 });

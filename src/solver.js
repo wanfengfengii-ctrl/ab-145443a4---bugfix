@@ -414,8 +414,11 @@ export function solve(input) {
 /* · U ≥ D0：用「精确目标」见证枚举盒内所有等成本频点（含需要不利步回退    */
 /*   才能恰好凑出 D0 的内部点，不能只看全有利角点），在这些频点上比较      */
 /*   第二（最大码长）、第三（码字字典序）决胜层级。                        */
-/* 枚举全部 Kraft 可行长度元组，逐一做精确可行性检查（保留前缀使纯 Kraft   */
-/* 不充分），再对每个可行异元组求盒内最小反例（非端点抽样、非旧结论复用）。*/
+/* 枚举全部 Kraft 可行长度元组（每类按距 l0 升序），逐一做精确可行性检查      */
+/* （保留前缀使纯 Kraft 不充分）。已有偏移 R 的见证后，用 Kraft 松弛 DP 对    */
+/* D0 求分支下界：R 个单位步至多贡献 R·max|a|，下界都超过即整支丢弃，故大     */
+/* 漂移盒的枚举规模与频次/漂移量级无关。                                      */
+/* 规范反例键：(总偏移, 单类最大偏移（均摊）, 频次序列字典序)。                */
 /* ===================================================================== */
 
 /** 码树 DFS 剪枝：前缀被已分配码字或保留前缀覆盖则整棵子树封禁。 */
@@ -534,6 +537,71 @@ function freqLess(a, b) {
 }
 
 /**
+ * 反例见证的规范比较键：
+ *   ① 总偏移 Σ|f_i−f0_i| 最小；
+ *   ② 并列时单类最大偏移 max_i|f_i−f0_i| 最小——漂移尽量均摊到多个类别，
+ *      而非让同一类独自承担两个（或更多）单位的偏移；
+ *   ③ 再并列时取实际频次序列字典序最小。
+ */
+function witnessSpread(freqs, f0) {
+  let spread = 0;
+  for (let i = 0; i < freqs.length; i++) {
+    const s = Math.abs(freqs[i] - f0[i]);
+    if (s > spread) spread = s;
+  }
+  return spread;
+}
+
+/** 候选 (offset, freqs) 是否严格优于当前最优见证。 */
+function witnessBetter(best, offset, freqs, f0) {
+  if (best === null || offset < best.offset) return true;
+  if (offset !== best.offset) return false;
+  const sNew = witnessSpread(freqs, f0);
+  const sBest = witnessSpread(best.freqs, f0);
+  return sNew < sBest || (sNew === sBest && freqLess(freqs, best.freqs));
+}
+
+/**
+ * 在同价值组的成员（各类、同向、容量 cap）间分配 totalC 个单位步：
+ * 先最小化单类最大份数（偏移均摊）；该约束下按成员顺序构造频次字典序最小
+ * 的分配——dir=+1（频次上移）尽量少取，dir=−1（频次下移）尽量多取。
+ * 返回每成员份数数组；totalC 超出总容量时返回 null。
+ */
+function spreadLexGroupAllocation(members, totalC) {
+  const m = members.length;
+  const caps = members.map((p) => p.cap);
+  let total = 0;
+  for (const c of caps) total += c;
+  if (totalC < 0 || totalC > total) return null;
+  const cover = (p) => {
+    let s = 0;
+    for (const c of caps) s += Math.min(c, p);
+    return s;
+  };
+  // 最小的单类份数上界 peak，使 Σ min(cap_k, peak) ≥ totalC。
+  let lo = 0;
+  let hi = Math.max(...caps);
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cover(mid) >= totalC) hi = mid;
+    else lo = mid + 1;
+  }
+  const peak = lo;
+  const takes = new Array(m).fill(0);
+  let remain = totalC;
+  for (let k = 0; k < m; k++) {
+    let tail = 0;
+    for (let j = k + 1; j < m; j++) tail += Math.min(caps[j], peak);
+    const low = Math.max(0, remain - tail);
+    const high = Math.min(caps[k], peak, remain);
+    // 上移类（dir=+1）取下界；下移类（dir=−1）取上界 ⇒ 频次序列字典序最小。
+    takes[k] = members[k].dir > 0 ? low : high;
+    remain -= takes[k];
+  }
+  return takes;
+}
+
+/**
  * 有界单位步模型（复核数学核心）。
  *
  * 对候选长度元组 l，令 a_i = l_i − l0_i、D0 = Σ f0_i·a_i（基准频次下替代码表
@@ -544,7 +612,7 @@ function freqLess(a, b) {
  *
  * · 严格更便宜：Δ ≤ −1 ⇔ G ≥ D0 + 1 —— 「至少目标」见证；
  * · 等成本：Δ = 0 ⇔ G = D0   —— 「精确目标」见证。
- * 两类见证都返回盒内 (总偏移最小, 频次序列字典序最小) 的频点。
+ * 两类见证都返回盒内 (总偏移最小, 单类最大偏移最小, 频次序列字典序最小) 的频点。
  */
 
 /** 把长度差整理为按价值降序的步组：value -> {total, members:[{i,dir,cap}]}。 */
@@ -588,42 +656,27 @@ function tailValue(values, copies, j, budget, maxFirst) {
 }
 
 /**
- * 给定各价值选中份数，在同组各警报容量约束下分配份数，构造字典序最小频次向量。
- * 组内按警报下标升序：下移（频次更小）在份额仍可由后续成员承担时尽量多取，
- * 上移尽量少取。
+ * 给定各价值选中份数，在同组各警报容量约束下分配份数：组内单类最大份数最小
+ * （偏移均摊），并列时构造频次序列字典序最小向量。
  */
 function buildFreqsFromChosen(chosen, model) {
   const { n, f0, a, groups, values } = model;
   const steps = new Array(n).fill(0);
   for (let j = 0; j < values.length; j++) {
-    let remain = chosen[j];
     const members = groups.get(values[j]).members;
-    const tailCap = new Array(members.length + 1).fill(0);
-    for (let k = members.length - 1; k >= 0; k--) {
-      tailCap[k] = tailCap[k + 1] + members[k].cap;
-    }
-    for (let k = 0; k < members.length; k++) {
-      const { i, dir, cap } = members[k];
-      let take;
-      if (dir === -1) {
-        take = Math.min(cap, remain);
-        if (remain - take > tailCap[k + 1]) take = remain - tailCap[k + 1];
-      } else {
-        take = Math.max(0, remain - tailCap[k + 1]);
-      }
-      steps[i] = take;
-      remain -= take;
-    }
+    const takes = spreadLexGroupAllocation(members, chosen[j]);
+    for (let k = 0; k < members.length; k++) steps[members[k].i] = takes[k];
   }
   return f0.map((f, i) => (a[i] < 0 ? f + steps[i] : f - steps[i]));
 }
 
 /**
- * 「至少目标」见证：总步数最小且总价值 ≥ K，并列取频次序列字典序最小。
- * 最大步贪心求最小步数 m 与 m 步最大价值 gMax；份数枚举窗口由
- * maxTail/minTail 二分夹逼（超额 slack < 临界步价值 ≤ 11），与 K 的量级无关。
+ * 「至少目标」见证：总步数最小且总价值 ≥ K，并列取 (单类最大偏移最小,
+ * 频次序列字典序最小)。最大步贪心求最小步数 m 与 m 步最大价值 gMax；份数
+ * 枚举窗口由 maxTail/minTail 二分夹逼（超额 slack < 临界步价值 ≤ 11），
+ * 与 K 的量级无关。boundOffset 给定时，最小步数已不可能更优则直接返回。
  */
-function witnessAtLeast(a, f0, d, K, tracker) {
+function witnessAtLeast(a, f0, d, K, tracker, boundOffset = Infinity) {
   const n = a.length;
   const { groups, values, copies, suffixCopies } = buildStepGroups(a, d);
   const q = values.length;
@@ -639,6 +692,8 @@ function witnessAtLeast(a, f0, d, K, tracker) {
     need -= take * values[j];
   }
   if (need > 0) return null;
+  // 步数只能更多：若贪心最小步数已无法在总偏移上改进全局最优，整支无需展开。
+  if (m > boundOffset) return null;
 
   const maxTail = (j, b) => tailValue(values, copies, j, b, true);
   const minTail = (j, b) => tailValue(values, copies, j, b, false);
@@ -650,7 +705,13 @@ function witnessAtLeast(a, f0, d, K, tracker) {
     if (j === q) {
       if (unitsLeft === 0 && prefixValue >= K) {
         const freqs = buildFreqsFromChosen(chosen, model);
-        if (bestFreqs === null || freqLess(freqs, bestFreqs)) bestFreqs = freqs;
+        if (bestFreqs === null) {
+          bestFreqs = freqs;
+        } else {
+          const sNew = witnessSpread(freqs, f0);
+          const sBest = witnessSpread(bestFreqs, f0);
+          if (sNew < sBest || (sNew === sBest && freqLess(freqs, bestFreqs))) bestFreqs = freqs;
+        }
       }
       return;
     }
@@ -748,28 +809,18 @@ function groupCoins(coins, caps) {
 }
 
 /**
- * 组内字典序最优分配：总份数 c 分到成员（0≤x≤cap），使频次序列字典序最小。
- * a<0（上移，频次 = f+x）类尽量少取；a>0（下移，频次 = f−x）类尽量多取，
- * 均以"剩余份数必须放得进后续成员"为可行性界。返回 Map(ci -> 份数) 或 null。
+ * 组内最优分配：总份数 c 分到成员（0≤x≤cap）。先最小化单类最大份数（偏移
+ * 均摊），再在该约束下取频次序列字典序最小（a<0 的上移类少取，a>0 的下移
+ * 类多取）。返回 Map(ci -> 份数) 或 null。各类仅属一个面值组，不同组的类
+ * 互不重叠，故逐组独立最小化即等价于全局最小化。
  */
-function allocGroup(members, totalC, aSignOfI) {
-  const tailCap = new Array(members.length + 1).fill(0);
-  for (let k = members.length - 1; k >= 0; k--) tailCap[k] = tailCap[k + 1] + members[k].cap;
-  if (totalC < 0 || totalC > tailCap[0]) return null;
+function allocGroup(members, totalC, _aSignOfI) {
+  const takes = spreadLexGroupAllocation(members, totalC);
+  if (!takes) return null;
   const out = new Map();
-  let remain = totalC;
-  for (let k = 0; k < members.length; k++) {
-    const { ci, i, cap } = members[k];
-    const up = aSignOfI[i] < 0; // a<0：正向步使频次上移
-    let take;
-    if (up) take = Math.max(0, remain - tailCap[k + 1]); // 上移类尽量少取
-    else {
-      take = Math.min(cap, remain); // 下移类尽量多取
-      if (remain - take > tailCap[k + 1]) take = remain - tailCap[k + 1];
-    }
-    out.set(ci, take);
-    remain -= take;
-  }
+  takes.forEach((x, k) => {
+    if (x > 0) out.set(members[k].ci, x);
+  });
   return out;
 }
 
@@ -1018,10 +1069,16 @@ function negativeTable(coins, caps, a, f0, tracker) {
         const m = new Map();
         counts.forEach((c, i) => { if (c) m.set(i, c); });
         const prev = byMask.get(mask);
-        if (!prev || used < prev.steps ||
-          (used === prev.steps && freqVecLess(negPlanFreqs(m, coins, a, f0),
-            negPlanFreqs(prev.plan, coins, a, f0)))) {
+        if (!prev) {
           byMask.set(mask, { steps: used, plan: m });
+        } else if (used === prev.steps) {
+          const fNew = negPlanFreqs(m, coins, a, f0);
+          const fOld = negPlanFreqs(prev.plan, coins, a, f0);
+          const sNew = witnessSpread(fNew, f0);
+          const sOld = witnessSpread(fOld, f0);
+          if (sNew < sOld || (sNew === sOld && freqVecLess(fNew, fOld))) {
+            byMask.set(mask, { steps: used, plan: m });
+          }
         }
         return;
       }
@@ -1080,11 +1137,7 @@ function witnessExact(a, f0, d, target, tracker) {
         for (const [ci, c] of negPlan) y[coins[ci].i] -= c;
         for (const [ci, c] of p.counts) y[coins[ci].i] += c;
         const freqs = f0.map((f, i) => (a[i] < 0 ? f + y[i] : f - y[i]));
-        if (best === null || offset < best.offset ||
-          (offset === best.offset && (function () {
-            for (let i = 0; i < n; i++) if (freqs[i] !== best.freqs[i]) return freqs[i] < best.freqs[i];
-            return false;
-          })())) {
+        if (witnessBetter(best, offset, freqs, f0)) {
           best = { offset, freqs };
         }
       }
@@ -1223,6 +1276,34 @@ export function checkRobustness(input) {
     }
   }
 
+  // 容量感知的基准代价差 D0 松弛 DP：
+  //   d0DP[i][cap] = 位置 i..n−1 在剩余容量 cap 下，仅考虑 Kraft 与码长区间时
+  //   可达的最小 Σ f0_i·(len_i−l0_i)。真实保留前缀约束只会更强，故这是合法
+  //   下界。找到偏移 ≤ R 的见证必有 G ≥ D0（层级一为 D0+1），而每个有利步
+  //   至多贡献 maxStepSuffix[i] = max_{k≥i}|len_k−l0_k|，故 D0 ≤ R·该上界；
+  //   下界都超过时整支不可能再改进当前最优见证。
+  const d0DP = Array.from({ length: n + 1 }, () => new Float64Array(FULL_CAPACITY + 1));
+  for (let cap = 0; cap <= FULL_CAPACITY; cap++) d0DP[n][cap] = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    const al = baseAlerts[i];
+    for (let cap = 0; cap <= FULL_CAPACITY; cap++) {
+      let bestD0 = Infinity;
+      for (let len = al.lo; len <= al.hi; len++) {
+        const wgt = codeWeight(len);
+        if (wgt > cap) continue;
+        const v = f0[i] * (len - l0[i]) + d0DP[i + 1][cap - wgt];
+        if (v < bestD0) bestD0 = v;
+      }
+      d0DP[i][cap] = bestD0;
+    }
+  }
+  // 后缀各类长度差绝对值的最大可能值（与 cap 无关的宽松上界）。
+  const maxStepSuffix = new Array(n + 1).fill(1);
+  for (let i = n - 1; i >= 0; i--) {
+    const m = Math.max(l0[i] - baseAlerts[i].lo, baseAlerts[i].hi - l0[i]);
+    maxStepSuffix[i] = Math.max(maxStepSuffix[i + 1], m, 1);
+  }
+
   let tuplesEnumerated = 0;
   let strictCandidates = 0;
   let tieCandidates = 0;
@@ -1230,10 +1311,24 @@ export function checkRobustness(input) {
   const lens = new Array(n);
 
   function offerCandidate(offset, freqs) {
-    if (best === null || offset < best.offset ||
-      (offset === best.offset && freqLess(freqs, best.freqs))) {
+    if (witnessBetter(best, offset, freqs, f0)) {
       best = { offset, freqs };
     }
+  }
+
+  /**
+   * 等成本点上该长度元组是否在第二/三级推翻当前码表：
+   * 最大码长更小，或等最大码长时其字典序最小码字序列严格更小。
+   */
+  function tieOverturns(maxLen) {
+    if (maxLen < L0) return true;
+    if (maxLen !== L0) return false;
+    const codes = lexCodes(lens);
+    if (!codes) return false;
+    for (let i = 0; i < n; i++) {
+      if (codes[i] !== c0[i]) return codes[i] < c0[i];
+    }
+    return false;
   }
 
   function considerTuple() {
@@ -1243,44 +1338,66 @@ export function checkRobustness(input) {
 
     let D0 = 0;
     let U = 0;
+    let maxAbsA = 0;
     const a = new Array(n);
     for (let i = 0; i < n; i++) {
       a[i] = lens[i] - l0[i];
       D0 += f0[i] * a[i];
       U += drifts[i] * Math.abs(a[i]);
+      if (Math.abs(a[i]) > maxAbsA) maxAbsA = Math.abs(a[i]);
     }
 
     // 层级一：盒内存在使该替代严格更便宜的频点。
     if (U >= D0 + 1) {
       strictCandidates++;
-      const w = witnessAtLeast(a, f0, drifts, D0 + 1, tracker);
+      // 贪心最小步数已不可能改进当前总偏移时，窄窗口枚举直接跳过。
+      const bound = best === null ? Infinity : best.offset;
+      const w = witnessAtLeast(a, f0, drifts, D0 + 1, tracker, bound);
       if (w) offerCandidate(w.offset, w.freqs);
     }
 
-    // 层级二/三：等成本频点（G = D0）。该频点须确实在第二、三级推翻当前
-    // 码表才算反例：最大码长更小，或等最大码长时字典序最小分配严格更小。
+    // 层级二/三：等成本频点（G = D0）。
     if (U >= D0) {
-      const w = witnessExact(a, f0, drifts, D0, tracker);
-      if (!w) return;
-      tieCandidates++;
+      // 任何等成本见证每个有利步至多贡献 maxAbsA 价值，故总偏移至少
+      // ⌈D0/maxAbsA⌉；该下界都无法在总偏移上改进当前最优 ⇒ 整支跳过。
+      const offsetLB = Math.ceil(D0 / maxAbsA);
+      if (best !== null && offsetLB > best.offset) return;
+
+      // 结构判定先行：该元组在等成本点确实能推翻当前码表才值得找见证，
+      // 避免对无法改变结论的元组做昂贵的带符号硬币搜索。
       const maxLen = Math.max(...lens);
-      let overturns = maxLen < L0;
-      if (!overturns && maxLen === L0) {
-        const codes = lexCodes(lens);
-        if (codes) {
-          for (let i = 0; i < n; i++) {
-            if (codes[i] !== c0[i]) {
-              overturns = codes[i] < c0[i];
-              break;
-            }
-          }
-        }
+      if (!tieOverturns(maxLen)) return;
+
+      let w = null;
+      if (U === D0) {
+        // 等成本唯一角点：所有有利步取满（a>0 频次下移 d_i，a<0 上移 d_i）。
+        // U=D0 时只有全部取满才能恰好凑出 D0，频点唯一且 O(n) 可得。
+        const wfreqs = f0.map((f, i) =>
+          a[i] > 0 ? f - drifts[i] : a[i] < 0 ? f + drifts[i] : f);
+        let woffset = 0;
+        for (let i = 0; i < n; i++) if (a[i] !== 0) woffset += drifts[i];
+        w = { offset: woffset, freqs: wfreqs };
+      } else {
+        // 一般内部点：带符号有界硬币 DP 求最小偏移见证（窗口常数化，与目标量级无关）。
+        w = witnessExact(a, f0, drifts, D0, tracker);
       }
-      if (overturns) offerCandidate(w.offset, w.freqs);
+      if (w) {
+        tieCandidates++;
+        offerCandidate(w.offset, w.freqs);
+      }
     }
   }
 
-  function dfs(i, cap, press) {
+  // 长度枚举顺序：每类按距当前码长 |len−l0| 升序（并列取短码优先），
+  // 使低偏移候选尽早出现，后续高偏移分支可被全局最优界剪枝。
+  const lensOrder = baseAlerts.map((al, i) => {
+    const opts = [];
+    for (let len = al.lo; len <= al.hi; len++) opts.push(len);
+    opts.sort((x, y) => Math.abs(x - l0[i]) - Math.abs(y - l0[i]) || x - y);
+    return opts;
+  });
+
+  function dfs(i, cap, press, d0prefix = 0, prefixMaxA = 0) {
     tracker.tick();
     // 容量感知上界剪枝：本分支即便最优选长度也无法使压力 ≥0，
     // 则盒内不存在等成本（press=0）或严格更便宜（press≥1）的频点。
@@ -1290,13 +1407,24 @@ export function checkRobustness(input) {
       return;
     }
     if (sufMinWeight[i] > cap) return;
-    const al = baseAlerts[i];
-    for (let len = al.lo; len <= al.hi; len++) {
+    // 全局偏移界剪枝：任何推翻都需某频点 G ≥ D0，而 R 个单位步至多贡献
+    // R·V（V=本分支可达的最大 |a|）价值；D0 下界都超过 R·V ⇒ 整支丢弃。
+    if (best !== null && Number.isFinite(d0DP[i][cap])) {
+      const V = Math.max(prefixMaxA, maxStepSuffix[i]);
+      if (d0prefix + d0DP[i][cap] > best.offset * V) return;
+    }
+    for (const len of lensOrder[i]) {
       const w = codeWeight(len);
       if (w > cap) continue;
       lens[i] = len;
       const aa = len - l0[i];
-      dfs(i + 1, cap - w, press + drifts[i] * Math.abs(aa) - f0[i] * aa);
+      dfs(
+        i + 1,
+        cap - w,
+        press + drifts[i] * Math.abs(aa) - f0[i] * aa,
+        d0prefix + f0[i] * aa,
+        Math.max(prefixMaxA, Math.abs(aa)),
+      );
     }
   }
 

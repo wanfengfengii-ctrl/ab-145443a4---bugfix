@@ -463,7 +463,7 @@ function renderRobustness(r) {
       首个改变的决胜层级为 <b>${esc(w.levelName)}</b>。
     </div>
     ${intervalTable}
-    <p class="hint">反例频次序列（总偏移最小，并列时按警报输入顺序取字典序最小）：
+    <p class="hint">反例频次序列（总偏移最小；并列时先取单类最大偏移最小即漂移均摊，再按警报输入顺序取字典序最小）：
       <code class="code alt">[${w.freqs.join(', ')}]</code></p>
     <h3>替代码表（在反例频次下重新求解）</h3>
     <table class="grid detail">
