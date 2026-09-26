@@ -1169,7 +1169,7 @@ export function checkRobustness(input) {
   const reservedWeight = reserved.reduce((sum, r) => sum + codeWeight(r.length), 0);
   const initialCapacity = (1 << MAX_CODE_LENGTH) - reservedWeight;
 
-  const tracker = makeTracker(6_000_000);
+  const tracker = makeTracker(200_000_000);
   const feasMemo = new Map(); // 长度多重集合 -> 是否存在精确分配
   const lexMemo = new Map(); // 有序长度元组 -> 字典序最小分配
 
@@ -1195,39 +1195,122 @@ export function checkRobustness(input) {
     return v;
   };
 
-  // Kraft 后缀最小容量需求。
-  const sufMinWeight = new Array(n + 1).fill(0);
-  for (let i = n - 1; i >= 0; i--) {
-    sufMinWeight[i] = sufMinWeight[i + 1] + codeWeight(baseAlerts[i].hi);
+  /*
+   * 枚举引擎（码长「多重集合」优先 + 指派感知精确界门控）
+   *
+   * 关键事实：在码长区间与保留前缀下，n 条前缀无关码字能否放下，只取决于码长的
+   * 「多重集合」（Kraft 容量与精确存在性检查均与"哪一类拿哪个长度"无关）。而
+   * n≤8、码长 1..12 时 Kraft 可行的多重集合很少（n=8 仅约 5.7 万个），把多重
+   * 集合指派给各类的「有标号元组」却可达数亿。因此分两层：
+   *
+   * A. 枚举全部 Kraft 可行的码长多重集合（非降），先做廉价的"区间可指派"匹配，
+   *    再对每个多重集合做一次精确码字存在性检查（按多重集合记忆化）。
+   * B. 仅对可指派且码字可行的多重集合枚举 类↔码长 指派；指派过程中用「指派
+   *    感知」的子集 DP 精确界（n≤8 ⇒ 至多 2^n 状态）门控：
+   *      · sP：合法指派下盒角点最大压力 Σ(d_i|a_i|−f0_i a_i)；整支上界 <0 则
+   *        任何频次都无法在等成本或更便宜上推翻，剪去；
+   *      · sD：合法指派下最小 Σ f0_i a_i，配合当前最优偏移 mStar 剪枝（每枚
+   *        有利步增益 ≤ max|a|≤11，偏移 ≤mStar 必有 D0≤11·mStar）。
+   *    通过的完整指派才计算贪心最小步数 / 字典序推翻判据，并只缓存极少数真正
+   *    需要昂贵见证的描述。
+   *
+   * 不抽样、不缩小漂移：稳健证书仍要求枚举全部 Kraft 可行多重集合及其全部合法
+   * 指派；门控只剪去"无论盒内频次如何都不可能在当前最优偏移内推翻"的分支。
+   */
+  const size1n = 1 << n;
+
+  // 每类 × 码长 的位势 pot=d|a|−f0·a 与基准代价差 d0v=f0·a（a=L−l0）。
+  const pot = Array.from({ length: n }, () => new Float64Array(MAX_CODE_LENGTH + 1));
+  const d0v = Array.from({ length: n }, () => new Float64Array(MAX_CODE_LENGTH + 1));
+  for (let i = 0; i < n; i++) {
+    for (let L = 1; L <= MAX_CODE_LENGTH; L++) {
+      const aa = L - l0[i];
+      pot[i][L] = drifts[i] * Math.abs(aa) - f0[i] * aa;
+      d0v[i][L] = f0[i] * aa;
+    }
   }
 
-  // 容量感知的"最大压力"松弛 DP（与求解器 costDP 同构）：
-  //   pressDP[i][cap] = 位置 i..n−1 在剩余 Kraft 容量 cap 下，仅考虑 Kraft
-  //   与码长区间时可达的最大压力 Σ(d_i|a_i| − f0_i·a_i)（a=len−l0）。
-  // 真实保留前缀约束只会更强，故这是合法上界；上界 < 0 即等成本角点都不存在。
-  const NEG_INF = -1e18;
-  const pressDP = Array.from({ length: n + 1 }, () => new Float64Array(FULL_CAPACITY + 1));
-  for (let cap = 0; cap <= FULL_CAPACITY; cap++) pressDP[n][cap] = 0;
-  for (let i = n - 1; i >= 0; i--) {
-    const al = baseAlerts[i];
-    for (let cap = 0; cap <= FULL_CAPACITY; cap++) {
-      let bestPress = NEG_INF;
-      for (let len = al.lo; len <= al.hi; len++) {
-        const wgt = codeWeight(len);
-        if (wgt > cap) continue;
-        const aa = len - l0[i];
-        const v = drifts[i] * Math.abs(aa) - f0[i] * aa + pressDP[i + 1][cap - wgt];
-        if (v > bestPress) bestPress = v;
-      }
-      pressDP[i][cap] = bestPress;
+  const popcnt = new Uint8Array(size1n);
+  for (let m = 1; m < size1n; m++) popcnt[m] = popcnt[m >> 1] + (m & 1);
+  const masksByPop = Array.from({ length: n + 1 }, () => []);
+  for (let m = 0; m < size1n; m++) masksByPop[popcnt[m]].push(m);
+  const bitIndex = new Array(size1n);
+  for (let i = 0; i < n; i++) bitIndex[1 << i] = i;
+  function* classBits(mask) {
+    let mm = mask;
+    while (mm) {
+      const b = mm & -mm;
+      yield bitIndex[b];
+      mm ^= b;
     }
+  }
+  const FULLMASK = size1n - 1;
+  const NEG = -1e18;
+
+  // 区间点匹配：升序码长点逐一分给"上限 hi 最小且区间包含该长度"的类。
+  const classByHi = baseAlerts
+    .map((al, i) => ({ i, lo: al.lo, hi: al.hi }))
+    .sort((p, q) => p.hi - q.hi || p.lo - q.lo || p.i - q.i);
+  function multisetAssignable(ms) {
+    const used = new Array(n).fill(false);
+    for (const L of ms) {
+      let pick = -1;
+      for (let k = 0; k < n; k++) {
+        const c = classByHi[k];
+        if (!used[k] && c.lo <= L && L <= c.hi) { pick = k; break; }
+      }
+      if (pick < 0) return false;
+      used[pick] = true;
+    }
+    return true;
+  }
+
+  /**
+   * 指派后缀界使用「跨多重集合复用」的共享缓冲 scratchP/scratchD：每个多重集合
+   * 只覆写本层会访问的 popcount 状态，随后立即枚举指派；避免为每个多重集合
+   * 分配数十个 Float64Array（n=8 宽区间时该分配曾占主要耗时）。
+   *   scratchP[k][mask] = 把槽位 k..n−1 指派给 popcount=n−k 的 mask 中各类的最大压力；
+   *   scratchD[k][mask] = 同构的最小 Σ f0·a。
+   */
+  const scratchP = Array.from({ length: n + 1 }, () => new Float64Array(size1n));
+  const scratchD = Array.from({ length: n + 1 }, () => new Float64Array(size1n));
+  function fillSuff(ms) {
+    scratchP[n].fill(NEG);
+    scratchD[n].fill(Infinity);
+    scratchP[n][0] = 0;
+    scratchD[n][0] = 0;
+    for (let k = n - 1; k >= 0; k--) {
+      const L = ms[k];
+      const curP = scratchP[k];
+      const curD = scratchD[k];
+      const nxtP = scratchP[k + 1];
+      const nxtD = scratchD[k + 1];
+      for (const mask of masksByPop[n - k]) {
+        let bp = NEG;
+        let bd = Infinity;
+        for (const i of classBits(mask)) {
+          const al = baseAlerts[i];
+          if (L < al.lo || L > al.hi) continue;
+          const pm = mask ^ (1 << i);
+          const a = nxtP[pm];
+          if (a > NEG / 2) { const v = pot[i][L] + a; if (v > bp) bp = v; }
+          const b = nxtD[pm];
+          if (Number.isFinite(b)) { const v = d0v[i][L] + b; if (v < bd) bd = v; }
+        }
+        curP[mask] = bp;
+        curD[mask] = bd;
+      }
+    }
+    return { maxPress: scratchP[0][FULLMASK], minD0: scratchD[0][FULLMASK] };
   }
 
   let tuplesEnumerated = 0;
   let strictCandidates = 0;
   let tieCandidates = 0;
   let best = null; // { offset, freqs }
-  const lens = new Array(n);
+  const strictPool = []; // 全局最小严格步数层：{ desc:{a, D0} }
+  let mStar = Infinity;
+  const tieDescs = [];  // { lb, lens, desc:{a, D0} }
 
   function offerCandidate(offset, freqs) {
     if (best === null || offset < best.offset ||
@@ -1236,69 +1319,119 @@ export function checkRobustness(input) {
     }
   }
 
-  function considerTuple() {
-    tuplesEnumerated++;
-    if (lens.every((x, i) => x === l0[i])) return;
-    if (!feasible(lens)) return;
-
-    let D0 = 0;
-    let U = 0;
-    const a = new Array(n);
-    for (let i = 0; i < n; i++) {
-      a[i] = lens[i] - l0[i];
-      D0 += f0[i] * a[i];
-      U += drifts[i] * Math.abs(a[i]);
+  const codewordFeasible = (ms, key) => {
+    let v = feasMemo.get(key);
+    if (v === undefined) {
+      v = assignmentExists(ms, reserved, initialCapacity, tracker);
+      feasMemo.set(key, v);
     }
+    return v;
+  };
 
-    // 层级一：盒内存在使该替代严格更便宜的频点。
-    if (U >= D0 + 1) {
-      strictCandidates++;
-      const w = witnessAtLeast(a, f0, drifts, D0 + 1, tracker);
-      if (w) offerCandidate(w.offset, w.freqs);
-    }
+  /** 对一个可行多重集合枚举全部合法指派（共享 scratch 界，逐多重集合即时使用）。 */
+  function enumerateAssignments(ms) {
+    const sP = scratchP;
+    const sD = scratchD;
+    const multMax = ms[n - 1];
+    const assigned = new Array(n); // 类 i 被指派的码长
 
-    // 层级二/三：等成本频点（G = D0）。该频点须确实在第二、三级推翻当前
-    // 码表才算反例：最大码长更小，或等最大码长时字典序最小分配严格更小。
-    if (U >= D0) {
-      const w = witnessExact(a, f0, drifts, D0, tracker);
-      if (!w) return;
-      tieCandidates++;
-      const maxLen = Math.max(...lens);
-      let overturns = maxLen < L0;
-      if (!overturns && maxLen === L0) {
-        const codes = lexCodes(lens);
-        if (codes) {
-          for (let i = 0; i < n; i++) {
-            if (codes[i] !== c0[i]) {
-              overturns = codes[i] < c0[i];
-              break;
+    function leaf(press, D0) {
+      const a = new Array(n);
+      for (let i = 0; i < n; i++) a[i] = assigned[i] - l0[i];
+
+      // 层级一：盒内存在使该替代严格更便宜的频点（press≥1 ⇔ U≥D0+1）。
+      if (press >= 1) {
+        strictCandidates++;
+        // 各类提供 d_i 枚面值 |a_i| 的同向步；大面值贪心得最少份数（精确）。
+        const caps = new Array(MAX_CODE_LENGTH + 1).fill(0);
+        for (let i = 0; i < n; i++) {
+          const vv = Math.abs(a[i]);
+          if (vv > 0) caps[vv] += drifts[i];
+        }
+        let m = 0;
+        let need = D0 + 1;
+        for (let vv = MAX_CODE_LENGTH - 1; vv >= 1 && need > 0; vv--) {
+          const take = Math.min(caps[vv], Math.ceil(need / vv));
+          m += take;
+          need -= take * vv;
+        }
+        if (need <= 0) {
+          if (m < mStar) { mStar = m; strictPool.length = 0; }
+          if (m === mStar) strictPool.push({ desc: { a: a.slice(), D0 } });
+        }
+      }
+
+      // 层级二/三：等成本频点（press≥0 ⇔ U≥D0）须确在第二、三级推翻当前码表。
+      if (press >= 0) {
+        tieCandidates++;
+        let overturns = multMax < L0;
+        if (!overturns && multMax === L0) {
+          const codes = lexCodes(assigned);
+          if (codes) {
+            for (let i = 0; i < n; i++) {
+              if (codes[i] !== c0[i]) { overturns = codes[i] < c0[i]; break; }
             }
           }
         }
+        if (overturns) {
+          let W = 0;
+          for (let i = 0; i < n; i++) if (drifts[i] > 0) W = Math.max(W, Math.abs(a[i]));
+          // 等成本 G=D0 每枚有利步至多贡献 W ⇒ 至少 ⌈D0/W⌉ 偏移。
+          const lb = W > 0 ? Math.ceil(D0 / W) : Infinity;
+          tieDescs.push({ lb, lens: assigned.slice(), desc: { a: a.slice(), D0 } });
+        }
       }
-      if (overturns) offerCandidate(w.offset, w.freqs);
     }
+
+    // 把槽位 k（码长 ms[k]）指派给尚未使用且区间合法的类。
+    // 等长槽位无差别：用「同类长度按类下标升序」打破对称，避免重复有标号元组。
+    (function dfs(k, used, press, D0, prevI) {
+      tracker.tick();
+      const rem = FULLMASK ^ used;
+      if (press + sP[k][rem] < 0) return; // 任何指派都无法使总压力 ≥0
+      if (mStar !== Infinity && D0 + sD[k][rem] > (MAX_CODE_LENGTH - 1) * mStar) return;
+      if (k === n) {
+        tuplesEnumerated++; // 基准元组自身也计入已复核的可行有标号元组
+        // 但基准码长元组不可能推翻自己，仅对异元组做候选分析。
+        for (let i = 0; i < n; i++) if (assigned[i] !== l0[i]) { leaf(press, D0); break; }
+        return;
+      }
+      const L = ms[k];
+      const sameLen = k > 0 && ms[k] === ms[k - 1];
+      for (const i of classBits(rem)) {
+        if (sameLen && i <= prevI) continue;
+        const al = baseAlerts[i];
+        if (L < al.lo || L > al.hi) continue;
+        assigned[i] = L;
+        dfs(k + 1, used | (1 << i), press + pot[i][L], D0 + d0v[i][L], i);
+      }
+    })(0, 0, 0, 0, -1);
   }
 
-  function dfs(i, cap, press) {
+  // 阶段 A：枚举全部 Kraft 可行码长多重集合。
+  const multisets = [];
+  (function genMultisets(k, minLen, cap, acc) {
     tracker.tick();
-    // 容量感知上界剪枝：本分支即便最优选长度也无法使压力 ≥0，
-    // 则盒内不存在等成本（press=0）或严格更便宜（press≥1）的频点。
-    if (press + pressDP[i][cap] < 0) return;
-    if (i === n) {
-      considerTuple();
+    if (k === n) {
+      if (cap >= 0 && multisetAssignable(acc)) multisets.push(acc.slice());
       return;
     }
-    if (sufMinWeight[i] > cap) return;
-    const al = baseAlerts[i];
-    for (let len = al.lo; len <= al.hi; len++) {
-      const w = codeWeight(len);
-      if (w > cap) continue;
-      lens[i] = len;
-      const aa = len - l0[i];
-      dfs(i + 1, cap - w, press + drifts[i] * Math.abs(aa) - f0[i] * aa);
+    for (let L = minLen; L <= MAX_CODE_LENGTH; L++) {
+      const w = codeWeight(L);
+      if (w > cap) continue; // 权重随码长单调减半：当前放不下，更长的码仍可能放下
+      acc.push(L);
+      genMultisets(k + 1, L, cap - w, acc);
+      acc.pop();
     }
-  }
+  })(0, 1, initialCapacity, []);
+
+  // 近基准的多重集合优先，尽早拿到小偏移 incumbent 使偏移门控生效。
+  const baseSorted = l0.slice().sort((x, y) => x - y);
+  multisets.sort((p, q) => {
+    let dp = 0, dq = 0;
+    for (let k = 0; k < n; k++) { dp += Math.abs(p[k] - baseSorted[k]); dq += Math.abs(q[k] - baseSorted[k]); }
+    return dp - dq || (p < q ? -1 : p > q ? 1 : 0);
+  });
 
   const intervals = baseAlerts.map((al, i) => ({
     name: al.name,
@@ -1311,7 +1444,55 @@ export function checkRobustness(input) {
   for (const d of drifts) combos *= BigInt(2 * d + 1);
 
   try {
-    dfs(0, initialCapacity, 0);
+    // 阶段 B：逐多重集合 码字存在性 → 指派界 → 合法指派枚举。
+    // 无保留前缀时，生成的多重集合已满足 Kraft 容量 ⇒ 必存在前缀码（Kraft–McMillan），
+    // 无需逐集合树搜索；有保留前缀（遮蔽约束使 Kraft 不充分）才做精确存在性检查。
+    const kraftOnly = reserved.length === 0;
+    const GAIN_CAP = MAX_CODE_LENGTH - 1; // 单枚有利步增益上界 = max|a_i|
+    for (const ms of multisets) {
+      if (!kraftOnly && !codewordFeasible(ms, ms.join(','))) continue;
+      // 廉价松弛界（允许同类被重复选用、忽略区间，只会更宽松）：
+      //   每槽独立取最大位势之和 ≥ 真实最优指派的最大压力；
+      //   每槽独立取最小代价之和 ≤ 真实最优指派的最小 D0。
+      // 松弛压力 < 0（或松弛 D0 已超当前可覆盖范围）即可跳过精确指派 DP。
+      let ubPress = 0;
+      let lbD0 = 0;
+      for (let k = 0; k < n; k++) {
+        const L = ms[k];
+        let mp = NEG;
+        let md = Infinity;
+        for (let i = 0; i < n; i++) {
+          if (pot[i][L] > mp) mp = pot[i][L];
+          if (d0v[i][L] < md) md = d0v[i][L];
+        }
+        ubPress += mp;
+        lbD0 += md;
+      }
+      if (ubPress < 0) continue;
+      if (mStar !== Infinity && lbD0 > GAIN_CAP * mStar) continue;
+      const { maxPress } = fillSuff(ms);
+      if (maxPress < 0) continue; // 没有任何指派能在盒内达到等成本/更便宜
+      enumerateAssignments(ms);
+    }
+
+    // 阶段 C：对极少数描述求解真正见证，找到全局最优即停。
+    // ① 层级一：仅全局最小严格步数 mStar 层的候选可能给出最优反例。
+    for (const s of strictPool) {
+      tracker.tick();
+      const w = witnessAtLeast(s.desc.a, f0, drifts, s.desc.D0 + 1, tracker);
+      if (w) offerCandidate(w.offset, w.freqs);
+    }
+
+    // ② 层级二/三：按等成本下界升序；下界超过当前最优偏移则不可能再改进。
+    tieDescs.sort((p, q) =>
+      p.lb - q.lb ||
+      (p.lens < q.lens ? -1 : p.lens > q.lens ? 1 : 0));
+    for (const t of tieDescs) {
+      if (best !== null && t.lb > best.offset) break;
+      tracker.tick();
+      const w = witnessExact(t.desc.a, f0, drifts, t.desc.D0, tracker);
+      if (w) offerCandidate(w.offset, w.freqs);
+    }
   } catch (err) {
     if (err.message === 'search_limit_exceeded') {
       return { status: 'error', reason: '稳健性复核搜索规模超出安全上限，请收紧码长区间或漂移幅度后重试。' };

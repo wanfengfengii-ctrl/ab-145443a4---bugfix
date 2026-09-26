@@ -511,3 +511,60 @@ test('大漂移大频次：复核可完成且见证/证书结构自洽', () => {
     assert.ok(r.tuplesEnumerated > 0);
   }
 });
+
+test('大漂移稳健性复核：5 类码长 [1,12]、频次 100..104、漂移均 100 快速返回规范反例', () => {
+  // 回归：该输入旧实现对近十万个长度元组逐个求昂贵见证，页面长期无结果。
+  const f0 = [100, 101, 102, 103, 104];
+  const input = {
+    alerts: f0.map((f, i) => robustAlert(`t${i}`, f, 1, 12)),
+    reserved: [],
+    drifts: [100, 100, 100, 100, 100],
+  };
+  const start = performance.now();
+  const r = checkRobustness(input);
+  const elapsed = performance.now() - start;
+
+  assert.equal(r.status, 'counterexample');
+  assert.ok(elapsed < 3000, `大漂移复核耗时 ${elapsed.toFixed(0)}ms，超出可用交互时间`);
+  // 仍覆盖盒内全部频次组合（201^5），且枚举出可行长度元组
+  assert.equal(r.combos, String(201 ** 5));
+  assert.ok(r.tuplesEnumerated > 0);
+
+  const w = r.witness;
+  // 最小总偏移量为 2；偏移 1 的 10 个相邻频点均不改变最终解。
+  assert.equal(w.totalOffset, 2);
+  assert.deepEqual(w.offsets, [0, 0, 2, 0, 0]);
+  // 同等偏移下频次序列字典序最小者（整数向量逐位比较）。
+  assert.deepEqual(w.freqs, [100, 101, 100, 103, 104]);
+  assert.equal(w.firstChangedLevel, 1);
+  // 见证频点确在盒内
+  w.freqs.forEach((f, i) => assert.ok(f >= f0[i] - 100 && f <= f0[i] + 100));
+  // 替代码表在该频点严格更便宜，且仍是合法前缀码
+  assert.ok(w.replacement.cost < w.baseline.costAtWitness);
+  assert.ok(isPrefixFree(w.replacement.codes));
+  assert.equal(w.baseline.codes.length, 5);
+});
+
+test('大漂移规范反例的最优性：偏移 1 无反例、偏移 2 字典序最小频点成立', () => {
+  const f0 = [100, 101, 102, 103, 104];
+  const mkAlerts = (fs) => fs.map((f, i) => robustAlert(`t${i}`, f, 1, 12));
+  const base = solve({ alerts: mkAlerts(f0), reserved: [] });
+  const l0 = base.lengths;
+  const c0 = base.alerts.map((a) => a.code).join('|');
+  const overturns = (fs) => {
+    const rr = solve({ alerts: mkAlerts(fs), reserved: [] });
+    if (rr.alerts.map((a) => a.code).join('|') === c0) return 0;
+    const cost0 = fs.reduce((s, f, k) => s + f * l0[k], 0);
+    return rr.cost < cost0 ? 1 : rr.maxLength !== base.maxLength ? 2 : 3;
+  };
+  // 偏移 1：仅 10 个相邻频点，均不改变最终解
+  for (let i = 0; i < 5; i++) {
+    for (const s of [-1, 1]) {
+      const fs = f0.slice();
+      fs[i] += s;
+      assert.equal(overturns(fs), 0, `偏移 1 频点 ${fs} 不应改变最终解`);
+    }
+  }
+  // 偏移 2 的字典序最小反例在第一层级推翻
+  assert.equal(overturns([100, 101, 100, 103, 104]), 1);
+});
